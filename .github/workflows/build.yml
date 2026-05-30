@@ -1,141 +1,129 @@
-name: Build OLLVM AArch64 Android
+name: Diagnose OLLVM Source
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  diagnose:
     runs-on: ubuntu-22.04
-    timeout-minutes: 350
+    timeout-minutes: 30
     
     steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h
-      
-      - name: Install dependencies
+      - name: Install minimal deps
         run: |
           sudo apt update
-          sudo apt install -y build-essential cmake ninja-build python3 git wget unzip zlib1g-dev
-      
-      - name: Download Android NDK r26d
-        run: |
-          cd $HOME
-          wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
-          unzip -q android-ndk-r26d-linux.zip
-          rm android-ndk-r26d-linux.zip
-          echo "NDK=$HOME/android-ndk-r26d" >> $GITHUB_ENV
+          sudo apt install -y git
       
       - name: Clone obfuscator-ollvm source
         run: |
           cd $HOME
           git clone --depth=1 https://github.com/AYssu/obfuscator-ollvm.git ollvm-src
+          du -sh ollvm-src
       
-      - name: Inspect repo structure (DIAGNOSTIC)
+      - name: "1. Obfuscation 目录结构"
         run: |
           cd $HOME/ollvm-src
-          # 找出 Obfuscation 源码在哪
-          find . -type d -name "Obfuscation" 2>/dev/null | head -10
-          echo "---"
-          # 找出 PassBuilder.cpp 是否被改过（看是否引用 Obfuscation）
-          grep -l "Obfuscation/" llvm/lib/Passes/PassBuilder.cpp 2>/dev/null && echo "PASSBUILDER HAS OBFUSCATION INCLUDES" || echo "passbuilder NOT patched"
-          echo "---"
-          # 看 lib/CMakeLists.txt 是否已经包含 add_subdirectory(Obfuscation)
-          grep -i "obfuscation" llvm/lib/CMakeLists.txt 2>/dev/null || echo "CMakeLists.txt does NOT mention Obfuscation"
-          echo "---"
-          # 看是否有 LLVM_OBFUSCATION_LINK_INTO_TOOLS 这个变量定义
-          grep -rn "LLVM_OBFUSCATION_LINK_INTO_TOOLS" llvm/ 2>/dev/null | head -5
+          echo "=== llvm/include/llvm/Transforms/Obfuscation 目录下的所有文件 ==="
+          ls -la llvm/include/llvm/Transforms/Obfuscation/ 2>/dev/null || echo "NOT EXIST"
+          echo ""
+          echo "=== llvm/lib/Transforms/Obfuscation 目录下的所有文件 ==="
+          ls -la llvm/lib/Transforms/Obfuscation/ 2>/dev/null || echo "NOT EXIST"
+          echo ""
+          echo "=== 全仓库搜索包含 Obfuscation 的目录 ==="
+          find . -type d -name "Obfuscation" 2>/dev/null
+          echo ""
+          echo "=== 全仓库搜索 obfuscation 相关 .h .cpp 文件 ==="
+          find . -type f \( -name "BogusControlFlow*" -o -name "Flattening*" -o -name "StringEncryption*" \) 2>/dev/null | head -30
       
-      - name: Stage 1 - Build host clang (x86_64 Linux)
+      - name: "2. Obfuscation 目录内 CMakeLists.txt"
         run: |
           cd $HOME/ollvm-src
-          mkdir -p build-host && cd build-host
-          
-          cmake -G Ninja ../llvm \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_ENABLE_PROJECTS="clang;lld" \
-            -DLLVM_TARGETS_TO_BUILD="AArch64;X86" \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_INCLUDE_BENCHMARKS=OFF \
-            -DLLVM_INCLUDE_DOCS=OFF \
-            -DLLVM_ENABLE_ASSERTIONS=OFF \
-            -DLLVM_OBFUSCATION_LINK_INTO_TOOLS=ON \
-            -DCMAKE_INSTALL_PREFIX=$HOME/host-clang
-          
-          ninja -j$(nproc) clang lld llvm-config llvm-tblgen clang-tblgen
-          ninja install
-          
-          ls -la $HOME/host-clang/bin/ | grep -E "tblgen|clang|llvm" | head -20
-          
-          cd $HOME && rm -rf ollvm-src/build-host
-          df -h
+          echo "=== llvm/lib/Transforms/Obfuscation/CMakeLists.txt 是否存在? ==="
+          if [ -f llvm/lib/Transforms/Obfuscation/CMakeLists.txt ]; then
+            echo "YES, content:"
+            cat llvm/lib/Transforms/Obfuscation/CMakeLists.txt
+          else
+            echo "NO - need to create one"
+          fi
       
-      - name: Stage 2 - Cross-compile clang for aarch64-android
+      - name: "3. llvm/lib/Transforms/CMakeLists.txt 内容"
         run: |
           cd $HOME/ollvm-src
-          mkdir -p build-android && cd build-android
-          
-          NDK_TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64
-          SYSROOT=$NDK_TOOLCHAIN/sysroot
-          
-          cmake -G Ninja ../llvm \
-            -DCMAKE_BUILD_TYPE=MinSizeRel \
-            -DLLVM_ENABLE_PROJECTS="clang" \
-            -DLLVM_TARGETS_TO_BUILD="AArch64" \
-            -DLLVM_DEFAULT_TARGET_TRIPLE="aarch64-linux-android21" \
-            -DLLVM_HOST_TRIPLE="aarch64-linux-android21" \
-            -DLLVM_TARGET_ARCH="AArch64" \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_INCLUDE_BENCHMARKS=OFF \
-            -DLLVM_INCLUDE_DOCS=OFF \
-            -DLLVM_ENABLE_ASSERTIONS=OFF \
-            -DLLVM_ENABLE_ZLIB=OFF \
-            -DLLVM_ENABLE_TERMINFO=OFF \
-            -DLLVM_ENABLE_LIBXML2=OFF \
-            -DLLVM_ENABLE_LIBEDIT=OFF \
-            -DLLVM_BUILD_TOOLS=ON \
-            -DCLANG_BUILD_TOOLS=ON \
-            -DLLVM_BUILD_UTILS=OFF \
-            -DLLVM_OBFUSCATION_LINK_INTO_TOOLS=ON \
-            -DLLVM_TABLEGEN=$HOME/host-clang/bin/llvm-tblgen \
-            -DCLANG_TABLEGEN=$HOME/host-clang/bin/clang-tblgen \
-            -DCMAKE_C_COMPILER=$NDK_TOOLCHAIN/bin/aarch64-linux-android21-clang \
-            -DCMAKE_CXX_COMPILER=$NDK_TOOLCHAIN/bin/aarch64-linux-android21-clang++ \
-            -DCMAKE_AR=$NDK_TOOLCHAIN/bin/llvm-ar \
-            -DCMAKE_RANLIB=$NDK_TOOLCHAIN/bin/llvm-ranlib \
-            -DCMAKE_STRIP=$NDK_TOOLCHAIN/bin/llvm-strip \
-            -DCMAKE_SYSROOT=$SYSROOT \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-            -DCMAKE_CXX_FLAGS="-O2 -fPIC" \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -Wl,--gc-sections" \
-            -DCMAKE_INSTALL_PREFIX=$HOME/ollvm-aarch64
-          
-          ninja -j$(nproc) clang
-          ninja install-clang
-          
-          df -h
+          echo "=== 完整内容 ==="
+          cat llvm/lib/Transforms/CMakeLists.txt
+          echo ""
+          echo "=== 是否已包含 Obfuscation? ==="
+          grep -i "obfuscation" llvm/lib/Transforms/CMakeLists.txt || echo "NOT MENTIONED"
       
-      - name: Strip and package
+      - name: "4. llvm/lib/Passes/PassBuilder.cpp 的 include 区"
         run: |
-          cd $HOME/ollvm-aarch64
-          find . -type f \( -name "clang*" -o -name "llvm-*" \) -exec \
-            $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-all {} \; 2>/dev/null || true
-          du -sh .
-          ls -la bin/
-          
-          cd $HOME
-          tar czf goron-ayssu-aarch64.tar.gz -C $HOME ollvm-aarch64
-          ls -lh goron-ayssu-aarch64.tar.gz
+          cd $HOME/ollvm-src
+          echo "=== 前 80 行（include 区域）==="
+          head -80 llvm/lib/Passes/PassBuilder.cpp
+          echo ""
+          echo "=== 搜索 cl::opt 定义位置 ==="
+          grep -n "static cl::opt" llvm/lib/Passes/PassBuilder.cpp | head -20
       
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: goron-ayssu-aarch64
-          path: ~/goron-ayssu-aarch64.tar.gz
-          retention-days: 30
+      - name: "5. PassBuilder::PassBuilder 构造函数位置"
+        run: |
+          cd $HOME/ollvm-src
+          echo "=== 找到构造函数定义 ==="
+          grep -n "^PassBuilder::PassBuilder" llvm/lib/Passes/PassBuilder.cpp
+          echo ""
+          echo "=== 找到 registerPipelineStartEPCallback 现有调用 ==="
+          grep -n "registerPipelineStartEPCallback\|registerPipelineParsingCallback" llvm/lib/Passes/PassBuilder.cpp | head -20
+      
+      - name: "6. Obfuscation 头文件 include 路径检查"
+        run: |
+          cd $HOME/ollvm-src
+          echo "=== Obfuscation cpp 文件如何引用自己的头文件 ==="
+          if [ -d llvm/lib/Transforms/Obfuscation ]; then
+            grep -h '#include' llvm/lib/Transforms/Obfuscation/*.cpp 2>/dev/null | grep -i "obfuscation\|flattening\|bogus\|substitution" | sort -u | head -20
+          fi
+          echo ""
+          echo "=== 头文件目录里的所有 .h ==="
+          ls llvm/include/llvm/Transforms/Obfuscation/ 2>/dev/null || echo "no include dir"
+      
+      - name: "7. Obfuscation/Utils.h 内容（看 LLVM API 兼容性）"
+        run: |
+          cd $HOME/ollvm-src
+          echo "=== 是否存在 Utils.h ==="
+          find . -name "Utils.h" -path "*Obfuscation*" -exec echo "FOUND: {}" \; -exec cat {} \; 2>/dev/null | head -100
+      
+      - name: "8. 检测是否有 compat 目录（兼容层）"
+        run: |
+          cd $HOME/ollvm-src
+          echo "=== compat 目录 ==="
+          find . -type d -name "compat" -path "*Obfuscation*" 2>/dev/null
+          echo ""
+          echo "=== CallSite.h 是否存在（LLVM 16+ 移除的 API）==="
+          find . -name "CallSite.h" -path "*Obfuscation*" 2>/dev/null | xargs ls -la 2>/dev/null
+      
+      - name: "9. README 内容"
+        run: |
+          cd $HOME/ollvm-src
+          echo "=== README.md ==="
+          cat README.md 2>/dev/null | head -80 || echo "NO README"
+          echo ""
+          echo "=== README*.md 列表 ==="
+          ls README* 2>/dev/null
+      
+      - name: "10. Obfuscation .cpp 文件 LLVM API 兼容性扫描"
+        run: |
+          cd $HOME/ollvm-src
+          echo "=== 搜索可能不兼容 LLVM 21 的旧 API ==="
+          if [ -d llvm/lib/Transforms/Obfuscation ]; then
+            cd llvm/lib/Transforms/Obfuscation
+            echo "--- getPointerElementType（LLVM 16+ 移除）---"
+            grep -rn "getPointerElementType" . 2>/dev/null | head -5
+            echo ""
+            echo "--- PointerType::get(Type, AS)（LLVM 17+ 改了）---"
+            grep -rn "PointerType::get" . 2>/dev/null | head -5
+            echo ""
+            echo "--- CallSite 类（LLVM 14+ 移除）---"
+            grep -rn "CallSite " . 2>/dev/null | head -5
+            echo ""
+            echo "--- opaque pointer 相关 ---"
+            grep -rn "OpaquePointer\|setOpaquePointers" . 2>/dev/null | head -5
+          fi
+      
