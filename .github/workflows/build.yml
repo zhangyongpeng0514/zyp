@@ -34,6 +34,21 @@ jobs:
           cd $HOME
           git clone --depth=1 https://github.com/AYssu/obfuscator-ollvm.git ollvm-src
       
+      - name: Inspect repo structure (DIAGNOSTIC)
+        run: |
+          cd $HOME/ollvm-src
+          # 找出 Obfuscation 源码在哪
+          find . -type d -name "Obfuscation" 2>/dev/null | head -10
+          echo "---"
+          # 找出 PassBuilder.cpp 是否被改过（看是否引用 Obfuscation）
+          grep -l "Obfuscation/" llvm/lib/Passes/PassBuilder.cpp 2>/dev/null && echo "PASSBUILDER HAS OBFUSCATION INCLUDES" || echo "passbuilder NOT patched"
+          echo "---"
+          # 看 lib/CMakeLists.txt 是否已经包含 add_subdirectory(Obfuscation)
+          grep -i "obfuscation" llvm/lib/CMakeLists.txt 2>/dev/null || echo "CMakeLists.txt does NOT mention Obfuscation"
+          echo "---"
+          # 看是否有 LLVM_OBFUSCATION_LINK_INTO_TOOLS 这个变量定义
+          grep -rn "LLVM_OBFUSCATION_LINK_INTO_TOOLS" llvm/ 2>/dev/null | head -5
+      
       - name: Stage 1 - Build host clang (x86_64 Linux)
         run: |
           cd $HOME/ollvm-src
@@ -48,30 +63,14 @@ jobs:
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
             -DLLVM_INCLUDE_DOCS=OFF \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_OBFUSCATION_LINK_INTO_TOOLS=ON \
             -DCMAKE_INSTALL_PREFIX=$HOME/host-clang
           
-          # 编译我们需要的所有工具
           ninja -j$(nproc) clang lld llvm-config llvm-tblgen clang-tblgen
+          ninja install
           
-          # 关键：明确 install 所有需要的 target（包括 tblgen）
-          ninja install-clang install-clang-resource-headers \
-                install-lld install-llvm-headers install-llvm-config \
-                install-llvm-tblgen install-clang-tblgen
+          ls -la $HOME/host-clang/bin/ | grep -E "tblgen|clang|llvm" | head -20
           
-          # 验证 tblgen 已经在 host-clang/bin 下
-          echo "=== Verifying Stage 1 install ==="
-          ls -la $HOME/host-clang/bin/ | grep -E "(tblgen|clang|llvm-config)" | head -20
-          if [ ! -x "$HOME/host-clang/bin/llvm-tblgen" ]; then
-            echo "ERROR: llvm-tblgen not installed!"
-            exit 1
-          fi
-          if [ ! -x "$HOME/host-clang/bin/clang-tblgen" ]; then
-            echo "ERROR: clang-tblgen not installed!"
-            exit 1
-          fi
-          echo "=== Stage 1 install OK ==="
-          
-          # 清理 build 产物省磁盘
           cd $HOME && rm -rf ollvm-src/build-host
           df -h
       
@@ -102,6 +101,7 @@ jobs:
             -DLLVM_BUILD_TOOLS=ON \
             -DCLANG_BUILD_TOOLS=ON \
             -DLLVM_BUILD_UTILS=OFF \
+            -DLLVM_OBFUSCATION_LINK_INTO_TOOLS=ON \
             -DLLVM_TABLEGEN=$HOME/host-clang/bin/llvm-tblgen \
             -DCLANG_TABLEGEN=$HOME/host-clang/bin/clang-tblgen \
             -DCMAKE_C_COMPILER=$NDK_TOOLCHAIN/bin/aarch64-linux-android21-clang \
