@@ -126,4 +126,11 @@ jobs:
             echo "--- opaque pointer 相关 ---"
             grep -rn "OpaquePointer\|setOpaquePointers" . 2>/dev/null | head -5
           fi
-      
+            - name: "11. 仓库 commit 信息"
+        run: |
+          cd $HOME/ollvm-src
+          echo "=== 最近 5 个 commit ==="
+          git log --oneline -5
+          echo ""
+          echo "=== 仓库总大小 ==="
+          du -sh .
