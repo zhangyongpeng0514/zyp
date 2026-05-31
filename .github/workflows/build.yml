@@ -89,6 +89,90 @@ jobs:
           fi
 
       # ---------------------------------------------------------------
+      # 5a. 关键 patch：补回 valueEscapes 函数
+      #     DreamSoule 的 Utils.cpp:193 调用了 valueEscapes()，但整个仓库
+      #     既无声明也无定义（实测 grep 全空）。这是上游漏搬 LLVM 官方
+      #     Reg2Mem.cpp:41 的辅助函数，导致 error: use of undeclared identifier。
+      #     这里把官方原版函数体插到 fixStack() 定义之前。
+      # ---------------------------------------------------------------
+      - name: Patch missing valueEscapes (DreamSoule bug)
+        run: |
+          F="$SRC/llvm/lib/Passes/Obfuscation/Utils.cpp"
+          if grep -q "valueEscapes" "$F" && ! grep -q "static bool valueEscapes" "$F"; then
+            python3 - "$F" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+anchor = "void llvm::fixStack(Function &F) {"
+if anchor not in s:
+    sys.exit("::error::fixStack 锚点未找到，Utils.cpp 源码结构变了，需更新 patch")
+helper = '''// === 自动补丁：取自 LLVM 官方 Reg2Mem.cpp:41 (llvmorg-17.0.6) ===
+// DreamSoule 漏搬此辅助函数，导致 Utils.cpp 报 undeclared identifier 'valueEscapes'
+static bool valueEscapes(const Instruction &Inst) {
+  if (!Inst.getType()->isSized())
+    return false;
+  const BasicBlock *BB = Inst.getParent();
+  for (const User *U : Inst.users()) {
+    const Instruction *UI = cast<Instruction>(U);
+    if (UI->getParent() != BB || isa<PHINode>(UI))
+      return true;
+  }
+  return false;
+}
+
+'''
+s = s.replace(anchor, helper + anchor, 1)
+open(p, "w", encoding="utf-8").write(s)
+print("valueEscapes 已插入")
+PY
+          else
+            echo "已存在 valueEscapes 定义或无需修补，跳过"
+          fi
+          echo "--- 确认 ---"
+          grep -n "static bool valueEscapes\|valueEscapes(I)\|llvm::fixStack" "$F" || true
+
+      # ---------------------------------------------------------------
+      # 5b. 编码修复：DreamSoule 部分源码是 Windows GBK 存的
+      #     在 Linux UTF-8 环境下 clang 会报 invalid UTF-8 in comment。
+      #     这里把 Obfuscation 下所有非 UTF-8 文件统一转成 UTF-8。
+      #     (实测确认 Substitution.h 是 iso-8859-1/GBK，全仓库就它一个)
+      # ---------------------------------------------------------------
+      - name: Fix source file encoding (GBK -> UTF-8)
+        run: |
+          sudo apt-get install -y file
+          cd "$SRC/llvm/lib/Passes/Obfuscation"
+          for f in $(find . -name "*.cpp" -o -name "*.h"); do
+            enc=$(file -b --mime-encoding "$f")
+            case "$enc" in
+              us-ascii|utf-8) ;;                       # 已 OK，跳过
+              *)
+                echo "转码 [$enc -> utf-8]: $f"
+                iconv -f GBK -t UTF-8 "$f" -o "$f.u8" && mv "$f.u8" "$f"
+                ;;
+            esac
+          done
+          echo "--- 复查（无输出=全部正常）---"
+          for f in $(find . -name "*.cpp" -o -name "*.h"); do
+            enc=$(file -b --mime-encoding "$f")
+            [ "$enc" != "us-ascii" ] && [ "$enc" != "utf-8" ] && echo "仍异常: $enc $f" || true
+          done
+
+      # ---------------------------------------------------------------
+      # 6. ccache 缓存（让你反复调试不必每次从零编 2 小时）
+      # ---------------------------------------------------------------
+      - name: ccache restore
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ollvm17-android-${{ github.sha }}
+          restore-keys: |
+            ollvm17-android-
+      - name: ccache config
+        run: |
+          ccache -M 5G
+          ccache -z
+
+      # ---------------------------------------------------------------
       # 7. Stage1：只编 host 版 tablegen（交叉编译必须用宿主机的 tblgen）
       #    不编完整 host clang，几分钟搞定
       # ---------------------------------------------------------------
@@ -99,6 +183,8 @@ jobs:
             -DLLVM_ENABLE_PROJECTS=clang \
             -DLLVM_TARGETS_TO_BUILD=AArch64 \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DCMAKE_CXX_FLAGS="-Wno-invalid-utf8 -Wno-error" \
+            -DCMAKE_C_FLAGS="-Wno-invalid-utf8 -Wno-error" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           ninja -C build-host llvm-tblgen clang-tblgen
@@ -117,7 +203,8 @@ jobs:
             -DANDROID_PLATFORM=android-${API} \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-g0" \
+            -DCMAKE_CXX_FLAGS="-g0 -Wno-invalid-utf8 -Wno-error" \
+            -DCMAKE_C_FLAGS="-Wno-invalid-utf8 -Wno-error" \
             -DLLVM_ENABLE_PROJECTS=clang \
             -DLLVM_TARGETS_TO_BUILD=AArch64 \
             -DLLVM_TABLEGEN=$PWD/build-host/bin/llvm-tblgen \
