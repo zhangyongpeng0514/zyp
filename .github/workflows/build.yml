@@ -1,154 +1,176 @@
-name: Build DreamSoule OLLVM17 AArch64
+name: ollvm17-android-arm64
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:          # 手动点按钮触发
+    inputs:
+      ndk_version:
+        description: "Android NDK 版本"
+        default: "r26d"
+        required: false
+
+env:
+  LLVM_VER: "17.0.6"
+  NDK_VER: "r26d"
+  API: "21"                   # android-21 = Android 5.0，akode 跑现代安卓没问题
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 350
+    timeout-minutes: 360      # 贴近 6h 上限。第一次无缓存最危险，缓存命中后会很快
 
     steps:
+      # ---------------------------------------------------------------
+      # 0. 狠删预装软件腾磁盘。不删的话 14GB 默认空间编 LLVM 必爆盘
+      # ---------------------------------------------------------------
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/lib/node_modules || true
+          sudo apt-get clean
+          df -h /
 
-      - name: Install dependencies
+      # ---------------------------------------------------------------
+      # 1. 装工具链
+      # ---------------------------------------------------------------
+      - name: Install build tools
         run: |
-          sudo apt update
-          sudo apt install -y build-essential cmake ninja-build python3 git wget unzip zlib1g-dev
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake ccache python3 wget xz-utils unzip clang lld
+          cmake --version && ninja --version
 
-      - name: Download Android NDK r26d
+      # ---------------------------------------------------------------
+      # 2. 下 Android NDK（用 r26，自带 LLVM17 sysroot，版本最贴近）
+      # ---------------------------------------------------------------
+      - name: Setup NDK
         run: |
-          cd $HOME
-          wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
-          unzip -q android-ndk-r26d-linux.zip
-          rm android-ndk-r26d-linux.zip
-          echo "NDK=$HOME/android-ndk-r26d" >> $GITHUB_ENV
+          cd /opt
+          wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VER}-linux.zip
+          unzip -q android-ndk-${NDK_VER}-linux.zip
+          echo "NDK=/opt/android-ndk-${NDK_VER}" >> $GITHUB_ENV
+          ls /opt/android-ndk-${NDK_VER}/build/cmake/android.toolchain.cmake
 
-      - name: Clone DreamSoule ollvm17 (already integrated LLVM 17 tree)
+      # ---------------------------------------------------------------
+      # 3. 下 LLVM 17.0.6 官方源码（整包 monorepo）
+      # ---------------------------------------------------------------
+      - name: Download LLVM source
         run: |
-          cd $HOME
-          git clone --depth=1 https://github.com/DreamSoule/ollvm17.git ollvm17
-          echo "=== 确认目录结构 ==="
-          ls -la ollvm17/
-          echo "--- 找 llvm 源码根 ---"
-          find ollvm17 -maxdepth 2 -name "CMakeLists.txt" -path "*llvm*" | head -5
-          echo "--- 确认 Obfuscation 已集成 ---"
-          find ollvm17 -type d -name "Obfuscation" | head -3
-          echo "--- 确认 PassBuilder 已 patch (应该能搜到 s_obf_fla) ---"
-          grep -rl "s_obf_fla" ollvm17/ 2>/dev/null | head -3
+          wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/llvm-project-${LLVM_VER}.src.tar.xz
+          tar -xf llvm-project-${LLVM_VER}.src.tar.xz
+          mv llvm-project-${LLVM_VER}.src llvm-src
+          echo "SRC=$PWD/llvm-src" >> $GITHUB_ENV
 
-      - name: Locate LLVM source root
+      # ---------------------------------------------------------------
+      # 4. 叠加 DreamSoule 的混淆 pass（直接 clone 上游，省得搬文件）
+      #    如果担心上游被删，把 Passes 目录提交进你自己仓库再 cp 即可
+      # ---------------------------------------------------------------
+      - name: Overlay DreamSoule obfuscation passes
         run: |
-          cd $HOME/ollvm17
-          # DreamSoule 结构可能是 llvm-project/llvm/ 或直接 llvm/
-          if [ -f llvm-project/llvm/CMakeLists.txt ]; then
-            echo "LLVM_SRC=$HOME/ollvm17/llvm-project/llvm" >> $GITHUB_ENV
-            echo "找到: llvm-project/llvm"
-          elif [ -f llvm/CMakeLists.txt ]; then
-            echo "LLVM_SRC=$HOME/ollvm17/llvm" >> $GITHUB_ENV
-            echo "找到: llvm"
-          else
-            echo "!!! 找不到 llvm/CMakeLists.txt，打印目录结构 !!!"
-            find . -maxdepth 3 -name "CMakeLists.txt" | head -20
+          git clone --depth 1 https://github.com/DreamSoule/ollvm17.git ollvm17
+          cp -rf ollvm17/llvm-project/llvm/lib/Passes/* "$SRC/llvm/lib/Passes/"
+          echo "--- 覆盖后 Passes 目录 ---"
+          ls "$SRC/llvm/lib/Passes/" "$SRC/llvm/lib/Passes/Obfuscation/"
+
+      # ---------------------------------------------------------------
+      # 5. 关键 patch：getBasicBlockList() 在 LLVM17 是 private
+      #    改成 public 的 Function::splice()，绕过、不动官方头文件
+      # ---------------------------------------------------------------
+      - name: Patch splice (LLVM17 private API)
+        run: |
+          F="$SRC/llvm/lib/Passes/Obfuscation/IPObfuscationContext.cpp"
+          before=$(grep -c "getBasicBlockList" "$F" || true)
+          sed -i 's#NF->getBasicBlockList()\.splice(NF->begin(), F->getBasicBlockList());#NF->splice(NF->begin(), F);#' "$F"
+          echo "patch 前 getBasicBlockList 出现 $before 次，patch 后："
+          grep -n "splice\|getBasicBlockList" "$F" || true
+          # 兜底自检：若仍残留 getBasicBlockList 说明上游改了源码，直接让 CI 失败提醒
+          if grep -q "getBasicBlockList" "$F"; then
+            echo "::error::splice patch 未完全命中，IPObfuscationContext.cpp 源码可能变了，需更新 sed"
             exit 1
           fi
 
-      - name: Stage 1 - Build host clang (x86_64 Linux)
+      # ---------------------------------------------------------------
+      # 7. Stage1：只编 host 版 tablegen（交叉编译必须用宿主机的 tblgen）
+      #    不编完整 host clang，几分钟搞定
+      # ---------------------------------------------------------------
+      - name: Stage1 - host tablegen
         run: |
-          cd $HOME/ollvm17
-          mkdir -p build-host && cd build-host
-
-          cmake -G Ninja $LLVM_SRC \
+          cmake -G Ninja -S "$SRC/llvm" -B build-host \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_ENABLE_PROJECTS="clang;lld" \
-            -DLLVM_TARGETS_TO_BUILD="AArch64;X86" \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_INCLUDE_BENCHMARKS=OFF \
-            -DLLVM_INCLUDE_DOCS=OFF \
-            -DLLVM_ENABLE_ASSERTIONS=ON \
-            -DLLVM_ENABLE_EH=OFF \
-            -DLLVM_ENABLE_RTTI=OFF \
-            -DCMAKE_INSTALL_PREFIX=$HOME/host-clang
-
-          ninja -j$(nproc) clang lld llvm-config llvm-tblgen clang-tblgen
-          ninja install
-
-          echo "=== host clang 验证 ==="
-          ls -la $HOME/host-clang/bin/ | grep -E "tblgen|clang|llvm" | head -20
-
-          cd $HOME && rm -rf ollvm17/build-host
-          df -h
-
-      - name: Stage 2 - Cross-compile clang for aarch64-android
-        run: |
-          cd $HOME/ollvm17
-          mkdir -p build-android && cd build-android
-
-          NDK_TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64
-          SYSROOT=$NDK_TOOLCHAIN/sysroot
-
-          cmake -G Ninja $LLVM_SRC \
-            -DCMAKE_BUILD_TYPE=MinSizeRel \
-            -DLLVM_ENABLE_PROJECTS="clang" \
-            -DLLVM_TARGETS_TO_BUILD="AArch64" \
-            -DLLVM_DEFAULT_TARGET_TRIPLE="aarch64-linux-android21" \
-            -DLLVM_HOST_TRIPLE="aarch64-linux-android21" \
-            -DLLVM_TARGET_ARCH="AArch64" \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_INCLUDE_BENCHMARKS=OFF \
-            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_ENABLE_PROJECTS=clang \
+            -DLLVM_TARGETS_TO_BUILD=AArch64 \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
-            -DLLVM_ENABLE_EH=OFF \
-            -DLLVM_ENABLE_RTTI=OFF \
-            -DLLVM_ENABLE_ZLIB=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          ninja -C build-host llvm-tblgen clang-tblgen
+          ls -la build-host/bin/llvm-tblgen build-host/bin/clang-tblgen
+
+      # ---------------------------------------------------------------
+      # 8. Stage2：交叉编 clang 到 aarch64-android
+      #    用 NDK toolchain file，指定 host tblgen，只编 AArch64 后端
+      #    一堆 -D 关掉测试/文档/无关依赖，缩短时间、避免 sysroot 缺库
+      # ---------------------------------------------------------------
+      - name: Stage2 - cross compile clang (arm64)
+        run: |
+          cmake -G Ninja -S "$SRC/llvm" -B build-android \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-${API} \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-g0" \
+            -DLLVM_ENABLE_PROJECTS=clang \
+            -DLLVM_TARGETS_TO_BUILD=AArch64 \
+            -DLLVM_TABLEGEN=$PWD/build-host/bin/llvm-tblgen \
+            -DCLANG_TABLEGEN=$PWD/build-host/bin/clang-tblgen \
+            -DLLVM_HOST_TRIPLE=aarch64-linux-android${API} \
+            -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-linux-android${API} \
+            -DLLVM_TARGET_ARCH=AArch64 \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_PIC=ON \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
             -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
             -DLLVM_ENABLE_LIBXML2=OFF \
             -DLLVM_ENABLE_LIBEDIT=OFF \
-            -DLLVM_BUILD_TOOLS=ON \
-            -DCLANG_BUILD_TOOLS=ON \
-            -DLLVM_BUILD_UTILS=OFF \
-            -DLLVM_TABLEGEN=$HOME/host-clang/bin/llvm-tblgen \
-            -DCLANG_TABLEGEN=$HOME/host-clang/bin/clang-tblgen \
-            -DCMAKE_C_COMPILER=$NDK_TOOLCHAIN/bin/aarch64-linux-android21-clang \
-            -DCMAKE_CXX_COMPILER=$NDK_TOOLCHAIN/bin/aarch64-linux-android21-clang++ \
-            -DCMAKE_AR=$NDK_TOOLCHAIN/bin/llvm-ar \
-            -DCMAKE_RANLIB=$NDK_TOOLCHAIN/bin/llvm-ranlib \
-            -DCMAKE_STRIP=$NDK_TOOLCHAIN/bin/llvm-strip \
-            -DCMAKE_SYSROOT=$SYSROOT \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-            -DCMAKE_CXX_FLAGS="-O2 -fPIC" \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -Wl,--gc-sections" \
-            -DCMAKE_INSTALL_PREFIX=$HOME/ollvm17-aarch64
+            -DLLVM_BUILD_LLVM_DYLIB=OFF \
+            -DLLVM_LINK_LLVM_DYLIB=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          # 只编必要产物：clang(含驱动+后端) + opt(手动调试 pass 用)
+          DESTDIR=$PWD/install ninja -C build-android \
+            install-clang \
+            install-clang-resource-headers \
+            install-opt
+          ccache -s
 
-          ninja -j$(nproc) clang
-          ninja install-clang
-
-          df -h
-
-      - name: Strip and package
+      # ---------------------------------------------------------------
+      # 9. strip + 打包（c++_static 后产物是自包含的，可直接丢手机）
+      # ---------------------------------------------------------------
+      - name: Strip & package
         run: |
-          cd $HOME/ollvm17-aarch64
-          find . -type f \( -name "clang*" -o -name "llvm-*" \) -exec \
-            $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-all {} \; 2>/dev/null || true
-          echo "=== 产物大小 ==="
-          du -sh .
-          ls -la bin/
+          STRIP=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
+          find install/usr/local/bin -type f -exec file {} \; | grep ELF | cut -d: -f1 | while read b; do
+            $STRIP --strip-all "$b" 2>/dev/null || true
+          done
+          cd install/usr/local
+          tar -czf ../../ollvm17-clang-android-arm64.tar.gz bin lib
+          cd ../../
+          ls -lh ollvm17-clang-android-arm64.tar.gz
+          du -sh install/usr/local/bin install/usr/local/lib
 
-          cd $HOME
-          tar czf dreamsoule-ollvm17-aarch64.tar.gz -C $HOME ollvm17-aarch64
-          ls -lh dreamsoule-ollvm17-aarch64.tar.gz
-
+      # ---------------------------------------------------------------
+      # 10. 上传，Actions 页面下载
+      # ---------------------------------------------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dreamsoule-ollvm17-aarch64
-          path: ~/dreamsoule-ollvm17-aarch64.tar.gz
-          retention-days: 30
+          name: ollvm17-clang-android-arm64
+          path: ollvm17-clang-android-arm64.tar.gz
+          retention-days: 7
