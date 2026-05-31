@@ -1,3 +1,4 @@
+
 name: ollvm17-android-arm64
 
 on:
@@ -19,9 +20,7 @@ jobs:
     timeout-minutes: 360      # 贴近 6h 上限。第一次无缓存最危险，缓存命中后会很快
 
     steps:
-      # ---------------------------------------------------------------
-      # 0. 狠删预装软件腾磁盘。不删的话 14GB 默认空间编 LLVM 必爆盘
-      # ---------------------------------------------------------------
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
@@ -30,18 +29,13 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      # ---------------------------------------------------------------
-      # 1. 装工具链
-      # ---------------------------------------------------------------
+
       - name: Install build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build cmake ccache python3 wget xz-utils unzip clang lld
           cmake --version && ninja --version
 
-      # ---------------------------------------------------------------
-      # 2. 下 Android NDK（用 r26，自带 LLVM17 sysroot，版本最贴近）
-      # ---------------------------------------------------------------
       - name: Setup NDK
         run: |
           cd /opt
@@ -60,10 +54,6 @@ jobs:
           mv llvm-project-${LLVM_VER}.src llvm-src
           echo "SRC=$PWD/llvm-src" >> $GITHUB_ENV
 
-      # ---------------------------------------------------------------
-      # 4. 叠加 DreamSoule 的混淆 pass（直接 clone 上游，省得搬文件）
-      #    如果担心上游被删，把 Passes 目录提交进你自己仓库再 cp 即可
-      # ---------------------------------------------------------------
       - name: Overlay DreamSoule obfuscation passes
         run: |
           git clone --depth 1 https://github.com/DreamSoule/ollvm17.git ollvm17
@@ -71,10 +61,6 @@ jobs:
           echo "--- 覆盖后 Passes 目录 ---"
           ls "$SRC/llvm/lib/Passes/" "$SRC/llvm/lib/Passes/Obfuscation/"
 
-      # ---------------------------------------------------------------
-      # 5. 关键 patch：getBasicBlockList() 在 LLVM17 是 private
-      #    改成 public 的 Function::splice()，绕过、不动官方头文件
-      # ---------------------------------------------------------------
       - name: Patch splice (LLVM17 private API)
         run: |
           F="$SRC/llvm/lib/Passes/Obfuscation/IPObfuscationContext.cpp"
@@ -88,13 +74,6 @@ jobs:
             exit 1
           fi
 
-      # ---------------------------------------------------------------
-      # 5a. 关键 patch：补回 valueEscapes 函数
-      #     DreamSoule 的 Utils.cpp:193 调用了 valueEscapes()，但整个仓库
-      #     既无声明也无定义（实测 grep 全空）。这是上游漏搬 LLVM 官方
-      #     Reg2Mem.cpp:41 的辅助函数，导致 error: use of undeclared identifier。
-      #     这里把官方原版函数体插到 fixStack() 定义之前。
-      # ---------------------------------------------------------------
       - name: Patch missing valueEscapes (DreamSoule bug)
         run: |
           F="$SRC/llvm/lib/Passes/Obfuscation/Utils.cpp"
@@ -131,12 +110,6 @@ PY
           echo "--- 确认 ---"
           grep -n "static bool valueEscapes\|valueEscapes(I)\|llvm::fixStack" "$F" || true
 
-      # ---------------------------------------------------------------
-      # 5b. 编码修复：DreamSoule 部分源码是 Windows GBK 存的
-      #     在 Linux UTF-8 环境下 clang 会报 invalid UTF-8 in comment。
-      #     这里把 Obfuscation 下所有非 UTF-8 文件统一转成 UTF-8。
-      #     (实测确认 Substitution.h 是 iso-8859-1/GBK，全仓库就它一个)
-      # ---------------------------------------------------------------
       - name: Fix source file encoding (GBK -> UTF-8)
         run: |
           sudo apt-get install -y file
@@ -157,9 +130,7 @@ PY
             [ "$enc" != "us-ascii" ] && [ "$enc" != "utf-8" ] && echo "仍异常: $enc $f" || true
           done
 
-      # ---------------------------------------------------------------
-      # 6. ccache 缓存（让你反复调试不必每次从零编 2 小时）
-      # ---------------------------------------------------------------
+  
       - name: ccache restore
         uses: actions/cache@v4
         with:
@@ -172,10 +143,6 @@ PY
           ccache -M 5G
           ccache -z
 
-      # ---------------------------------------------------------------
-      # 7. Stage1：只编 host 版 tablegen（交叉编译必须用宿主机的 tblgen）
-      #    不编完整 host clang，几分钟搞定
-      # ---------------------------------------------------------------
       - name: Stage1 - host tablegen
         run: |
           cmake -G Ninja -S "$SRC/llvm" -B build-host \
@@ -190,11 +157,6 @@ PY
           ninja -C build-host llvm-tblgen clang-tblgen
           ls -la build-host/bin/llvm-tblgen build-host/bin/clang-tblgen
 
-      # ---------------------------------------------------------------
-      # 8. Stage2：交叉编 clang 到 aarch64-android
-      #    用 NDK toolchain file，指定 host tblgen，只编 AArch64 后端
-      #    一堆 -D 关掉测试/文档/无关依赖，缩短时间、避免 sysroot 缺库
-      # ---------------------------------------------------------------
       - name: Stage2 - cross compile clang (arm64)
         run: |
           cmake -G Ninja -S "$SRC/llvm" -B build-android \
@@ -237,9 +199,6 @@ PY
             install-opt
           ccache -s
 
-      # ---------------------------------------------------------------
-      # 9. strip + 打包（c++_static 后产物是自包含的，可直接丢手机）
-      # ---------------------------------------------------------------
       - name: Strip & package
         run: |
           STRIP=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
@@ -252,9 +211,6 @@ PY
           ls -lh ollvm17-clang-android-arm64.tar.gz
           du -sh install/usr/local/bin install/usr/local/lib
 
-      # ---------------------------------------------------------------
-      # 10. 上传，Actions 页面下载
-      # ---------------------------------------------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
