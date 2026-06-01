@@ -75,40 +75,48 @@ jobs:
       # 5. 关键 patch：getBasicBlockList() 在 LLVM17 是 private
       #    改成 public 的 Function::splice()，绕过、不动官方头文件
       # ---------------------------------------------------------------
-      - name: Patch missing valueEscapes (DreamSoule bug)
+      - name: Patch splice (LLVM17 private API)
+        run: |
+          F="$SRC/llvm/lib/Passes/Obfuscation/IPObfuscationContext.cpp"
+          before=$(grep -c "getBasicBlockList" "$F" || true)
+          sed -i 's#NF->getBasicBlockList()\.splice(NF->begin(), F->getBasicBlockList());#NF->splice(NF->begin(), F);#' "$F"
+          echo "patch 前 getBasicBlockList 出现 $before 次，patch 后："
+          grep -n "splice\|getBasicBlockList" "$F" || true
+          # 兜底自检：若仍残留 getBasicBlockList 说明上游改了源码，直接让 CI 失败提醒
+          if grep -q "getBasicBlockList" "$F"; then
+            echo "::error::splice patch 未完全命中，IPObfuscationContext.cpp 源码可能变了，需更新 sed"
+            exit 1
+          fi
+                - name: Patch missing valueEscapes (DreamSoule bug)
         run: |
           F="$SRC/llvm/lib/Passes/Obfuscation/Utils.cpp"
           if grep -q "valueEscapes" "$F" && ! grep -q "static bool valueEscapes" "$F"; then
-            python3 - "$F" <<'PY'
-import sys
-p = sys.argv[1]
-s = open(p, encoding="utf-8").read()
-anchor = "void llvm::fixStack(Function &F) {"
-if anchor not in s:
-    sys.exit("::error::fixStack 锚点未找到，Utils.cpp 源码结构变了，需更新 patch")
-helper = '''// === 自动补丁：取自 LLVM 官方 Reg2Mem.cpp:41 (llvmorg-17.0.6) ===
-// DreamSoule 漏搬此辅助函数，导致 Utils.cpp 报 undeclared identifier 'valueEscapes'
-static bool valueEscapes(const Instruction &Inst) {
-  if (!Inst.getType()->isSized())
-    return false;
-  const BasicBlock *BB = Inst.getParent();
-  for (const User *U : Inst.users()) {
-    const Instruction *UI = cast<Instruction>(U);
-    if (UI->getParent() != BB || isa<PHINode>(UI))
-      return true;
-  }
-  return false;
-}
-
-'''
-s = s.replace(anchor, helper + anchor, 1)
-open(p, "w", encoding="utf-8").write(s)
-print("valueEscapes 已插入")
-PY
+            if ! grep -q "void llvm::fixStack(Function &F) {" "$F"; then
+              echo "::error::fixStack anchor not found, Utils.cpp changed, need update patch"
+              exit 1
+            fi
+            HELPER=/tmp/valueescapes_helper.txt
+            : > "$HELPER"
+            echo '// auto patch: from LLVM official Reg2Mem.cpp:41 (llvmorg-17.0.6)' >> "$HELPER"
+            echo 'static bool valueEscapes(const Instruction &Inst) {' >> "$HELPER"
+            echo '  if (!Inst.getType()->isSized())' >> "$HELPER"
+            echo '    return false;' >> "$HELPER"
+            echo '  const BasicBlock *BB = Inst.getParent();' >> "$HELPER"
+            echo '  for (const User *U : Inst.users()) {' >> "$HELPER"
+            echo '    const Instruction *UI = cast<Instruction>(U);' >> "$HELPER"
+            echo '    if (UI->getParent() != BB || isa<PHINode>(UI))' >> "$HELPER"
+            echo '      return true;' >> "$HELPER"
+            echo '  }' >> "$HELPER"
+            echo '  return false;' >> "$HELPER"
+            echo '}' >> "$HELPER"
+            echo '' >> "$HELPER"
+            sed -i 's#^void llvm::fixStack(Function &F) {#__VALUEESCAPES_INSERT__\nvoid llvm::fixStack(Function \&F) {#' "$F"
+            sed -i -e "/__VALUEESCAPES_INSERT__/r $HELPER" -e '/__VALUEESCAPES_INSERT__/d' "$F"
+            echo "valueEscapes inserted"
           else
-            echo "已存在 valueEscapes 定义或无需修补，跳过"
+            echo "valueEscapes already present or no need, skip"
           fi
-          echo "--- 确认 ---"
+          echo "--- verify ---"
           grep -n "static bool valueEscapes\|valueEscapes(I)\|llvm::fixStack" "$F" || true
 
       # ---------------------------------------------------------------
@@ -136,11 +144,7 @@ PY
             enc=$(file -b --mime-encoding "$f")
             [ "$enc" != "us-ascii" ] && [ "$enc" != "utf-8" ] && echo "仍异常: $enc $f" || true
           done
-
-      # ---------------------------------------------------------------
-      # 6. ccache 缓存（让你反复调试不必每次从零编 2 小时）
-      # ---------------------------------------------------------------
-      - name: ccache restore
+               - name: ccache restore
         uses: actions/cache@v4
         with:
           path: ~/.ccache
